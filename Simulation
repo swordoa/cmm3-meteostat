@@ -1,0 +1,178 @@
+
+# Libraries
+from datetime import datetime
+from meteostat import Point, Hourly
+import yaml
+import numpy as np
+from scipy.optimize import curve_fit
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+
+# Step 1: Data Collection with Meteostat
+# Get the weather data from meteostat for Edinburgh
+location       = Point(55.9533, -3.1883)
+start          = datetime(2024, 10, 7, 0)
+end            = datetime(2024, 10, 8, 0)
+meteostat_data = Hourly(location, start, end)
+weather_data   = meteostat_data.fetch()
+
+
+# Step 2: Data Fitting Using Manufacturer COP Data
+# Read the YAML file to access COP data
+with open("/Users/khinemyo/Downloads/heat_pump_cop_synthetic_full (1).yaml", 'r') as file:
+    cop_data = yaml.safe_load(file)
+
+# Extract outdoor temperature and COP values from YAML file
+cop_temps_C = []
+cop_values   = []
+
+for entry in cop_data['heat_pump_cop_data']:
+    cop_temps_C.append(entry['outdoor_temp_C'])
+    cop_values.append(entry['COP_noisy'])
+
+# Convert to numpy arrays for later calculations
+cop_temps_C = np.array(cop_temps_C)
+cop_values = np.array(cop_values)
+
+delta_T = 60 - cop_temps_C
+
+# Defining the COP model
+def cop_model(delta_T, a, b):
+    return a + (b / delta_T)
+
+# Function to find a and b
+popt, pcov = curve_fit(cop_model, delta_T, cop_values)
+
+a, b = popt
+print(f'Fitted values: a = {a}, b = {b}')
+
+
+# Step 3: Heat Load Calculation
+# Read the inputs YAML file to access data
+with open("/Users/khinemyo/Downloads/inputs (1).yaml", 'r') as file:
+    input_data = yaml.safe_load(file)
+
+# Extract building properties
+A_w  = input_data['building_properties']['wall_area']['value']
+U_w  = input_data['building_properties']['wall_U_value']['value']
+A_r  = input_data['building_properties']['roof_area']['value']
+U_r  = input_data['building_properties']['roof_U_value']['value']
+T_sp = input_data['building_properties']['indoor_setpoint_temperature_K']['value']
+
+# Extract other necessary values
+sim_time       = input_data['simulation_parameters']['total_time_seconds']['value']
+time_points    = input_data['simulation_parameters']['time_points']['value']
+
+interval = int(sim_time / time_points)
+
+# Using meteostat data, get the ambient temperatures at each hour
+T_amb_C = weather_data['temp'].tolist()
+T_amb = [t + 273.15 for t in T_amb_C]
+
+# Q_load calculation
+def Q_load_calc_current(T_amb_current):
+    return -((A_w * U_w * (T_amb_current - T_sp)) + (A_r * U_r * (T_amb_current - T_sp)))
+
+
+# Step 4: Heat Pump
+# Extract heat pump properties
+U_cond = input_data['heat_pump']['overall_heat_transfer_coefficient']['value']
+A_cond = input_data['heat_pump']['heat_transfer_area']['value']
+#T_cond = input_data['heat_pump']['fixed_condenser_temperature_K']['value']
+T_cond = 338.15  # [K]
+T_min  = input_data['heat_pump']['on_temperature_threshold_K']['value']
+T_max  = input_data['heat_pump']['off_temperature_threshold_K']['value']
+T_tank_initial = input_data['initial_conditions']['initial_tank_temperature_K']['value']
+
+# Function to determine the satus of the heat pump
+heat_pump = False   # Initialise
+heat_pump_list = []
+def heat_pump_system(T_tank_list):
+    global heat_pump
+    # Update heat pump state based on the temperature thresholds
+    if T_tank_list <= T_min:
+        heat_pump = True   # Turn heat pump on
+    elif T_tank_list >= T_max:
+        heat_pump = False   # Turn heat pump off
+    else:
+        heat_pump = None
+    return heat_pump
+
+# Q_trans calculation
+def Q_trans_calc_current(T_tank, heat_pump):
+    if heat_pump == True:
+        return U_cond * A_cond * (T_cond - T_tank)   # Only calculate Q_trans if the heat pump is on
+    else:    
+        return 0   # Q_trans = 0 if the heat pump is off
+
+
+# Step 5: ODE Setup for Tank Dynamics
+# Extract necessary values from inputs.yaml
+U_tank = input_data['hot_water_tank']['heat_loss_coefficient']['value']
+C_t = input_data['hot_water_tank']['total_thermal_capacity']['value']
+mass_w = input_data['hot_water_tank']['mass_of_water']['value']
+rho_w = 1000   # Density of water [kg / m^3]
+
+vol_w = 1 * (mass_w / rho_w)   # [m^3]
+# Assuming a cylinder, and that its height is 3x the radius. Currently tank is 100% full, no air gaps (change the '1' to a different multiplier for air gaps)
+r_tank = (np.cbrt(vol_w / (3 * np.pi)))
+h_tank = 3 * r_tank
+A_tank = (2 * np.pi * r_tank**2) + (2 * np.pi * r_tank * h_tank)   # Surface area of the tank
+
+# Q_loss calculation
+def Q_loss_calc_current(T_tank, T_amb_current):
+    return U_tank * A_tank * (T_tank - T_amb_current)
+
+# dT_tank calculation
+def dT_tank_calc_current(q_hp, q_load, q_loss):
+    return (q_hp - q_load - q_loss) / C_t
+
+
+# Step 6: Solving the ODE System
+# Temperatures calculation
+def temps_calc_current(t, temp):
+    global heat_pump
+    T_tank = temp[0]
+    hour = int(t // 3600)
+    T_amb_current = T_amb[hour]
+
+    # Determine heat pump state
+    heat_pump_list.append(heat_pump)
+    heat_pump = heat_pump_system(temp[0])
+    latest_heat_pump_change = max(
+        (len(heat_pump_list) - 1 - heat_pump_list[::-1].index(True)) if True in heat_pump_list else -1,
+        (len(heat_pump_list) - 1 - heat_pump_list[::-1].index(False)) if False in heat_pump_list else -1
+        )
+    if heat_pump is None:
+        # If heat pump state remains unchanged, use the previous state
+        heat_pump = heat_pump_list[latest_heat_pump_change]
+
+    # Calculate Q_hp, Q_load and Q_loss
+    q_hp = Q_trans_calc_current(temp[0], heat_pump)
+    q_load = Q_load_calc_current(T_amb_current)
+    q_loss = Q_loss_calc_current(temp[0], T_amb_current)
+    
+    # Calculate dT_tank
+    dT_tank = dT_tank_calc_current(q_hp, q_load, q_loss)
+    temp += dT_tank
+    T_tank += dT_tank
+    return dT_tank
+
+# Run the simulation
+times = np.linspace(0, sim_time, int(sim_time * 3600 / interval))
+solution = solve_ivp(temps_calc_current, [0, sim_time], [T_tank_initial], t_eval = times)
+temps = solution.y[0]
+temps_C = [t - 273.15 for t in temps]
+#cops = cop_calc_current()
+
+# Plot the results
+plt.figure(figsize=(12, 6))
+plt.plot(solution.t / 3600, temps_C, label = 'Tank Temperature (°C)', color = 'blue')
+plt.axhline(y = 40, color = 'green', linestyle = '--', label = 'Heat Pump On Threshold (40°C)')
+plt.axhline(y = 60, color = 'orange', linestyle = '--', label = 'Heat Pump Off Threshold (60°C)')
+plt.xlabel('Time (hours)')
+plt.ylabel('Tank Temperature (°C)')
+plt.title('Heat Pump and Hot Water Tank Dynamics with On/Off Control')
+plt.legend(loc='best')
+plt.grid(True)
+plt.show()
